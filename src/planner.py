@@ -3,37 +3,26 @@ planner.py - the orchestrator (dynamic plan + deterministic business rules).
 
 Design: sense -> plan -> act.
 
-  1. SENSE   Ingestion always runs first. You cannot plan what to do about a
-             customer until you've read the interaction, so ingestion is the
-             one fixed step - it's perception, not a choice.
-
-  2. PLAN    Two layers, in order:
-               a) Deterministic BUSINESS RULES (config/domain.yaml). These fire
-                  on clear-cut cases and guarantee predictable behaviour - e.g. a
-                  healthy, quiet account short-circuits straight to "keep
-                  monitoring" without spending any LLM calls. They are also a
-                  safety backstop if the LLM planner misbehaves.
-               b) If no rule fires, an LLM PLANNING step looks at the situation
-                  and decides which specialist agents to run, in what order, and
-                  how deep to retrieve (k).
-             This is what makes the platform agentic rather than a hard-coded
-             pipeline: different customers take genuinely different routes.
-
+  1. SENSE   Ingestion always runs first - perception, not a choice.
+  2. PLAN    Deterministic BUSINESS RULES (domain.yaml) first; if none fire, an
+             LLM PLANNING step picks which specialist agents to run and how deep
+             to retrieve. Different customers take genuinely different routes.
   3. ACT     The Planner executes the chosen plan against a shared context and
-             records a trace (which step ran and why) so the orchestration
-             itself is explainable - not just the recommendation.
+             records a trace so the orchestration itself is explainable.
 
-Guardrails (mirroring the recommendation agent's "drop invalid actions"):
-  - Unknown step names returned by the LLM are dropped.
-  - Data dependencies are auto-repaired: a recommendation needs an analysis to
-    reason over, so analysis is inserted if the plan forgot it. Steps then run
-    in a safe canonical order.
-  - If the planning call fails or returns nothing usable, we fall back to the
-    full pipeline - never worse than the old static behaviour.
+Extensibility:
+  Agents are executed through a DISPATCH TABLE (self._handlers) keyed by agent
+  name, not a hardcoded if/elif chain. Adding a new agent is additive: list it
+  in domain.yaml (agents:), give it a dependency + canonical position + one-line
+  description below, write the agent class, and register one handler. The
+  execution loop never changes.
 
-The packet shape is unchanged (run.py / the future UI keep working); we only
-ADD a "plan" key carrying the chosen steps, the reason, the rule (if any), and
-the trace.
+Guardrails:
+  - Unknown step names returned by the LLM are dropped (and skipped if they
+    somehow reach the loop without a handler).
+  - Data dependencies are auto-repaired and run in a safe canonical order.
+  - If planning fails or returns nothing usable, we fall back to the full
+    pipeline - never worse than the old static behaviour.
 """
 import json
 
@@ -49,8 +38,8 @@ import memory
 # ingestion is excluded because it's the fixed "sense" step that always runs.
 PLANNABLE = [a for a in ALLOWED_AGENTS if a != "ingestion"]
 
-# Canonical run order. Every dependency points "leftwards" in this list, so
-# sorting a chosen step-set by this order automatically satisfies dependencies.
+# Canonical run order. Every dependency points "leftwards" here, so sorting a
+# chosen step-set by this order automatically satisfies dependencies.
 CANONICAL_ORDER = ["retrieval", "analysis", "recommendation"]
 
 # Hard data dependencies: what must have run before each step.
@@ -73,13 +62,15 @@ AGENT_DESCRIPTIONS = {
 # Deterministic business rules, loaded from domain.yaml (tunable without code).
 BUSINESS_RULES = DOMAIN.get("business_rules", {})
 
-# Signals that mean "this needs attention" - any of these blocks the healthy
-# short-circuit. This is platform taxonomy, not a per-deployment knob.
+# Signals that mean "this needs attention" - any blocks the healthy short-circuit.
 ACTION_SIGNALS = {
     "champion_left", "usage_down", "competitor_mentioned", "low_seat_activation",
     "renewal_risk", "budget_pressure", "expansion_interest", "onboarding_gap",
     "feature_request", "support_issue",
 }
+
+# Canonical id -> label, so a recorded action always gets its proper label.
+ACTION_LABELS = {a["id"]: a["label"] for a in NEXT_BEST_ACTIONS}
 
 
 class Planner:
@@ -88,6 +79,37 @@ class Planner:
         self.retrieval = RetrievalAgent()
         self.analysis = AnalysisAgent()
         self.recommendation = RecommendationAgent()
+
+        # Dispatch table: agent name -> handler. THIS is the extension point.
+        # A handler takes (ingestion, ctx, plan), mutates the shared ctx, and
+        # returns a short trace detail string. To add an agent, register it here.
+        self._handlers = {
+            "retrieval": self._do_retrieval,
+            "analysis": self._do_analysis,
+            "recommendation": self._do_recommendation,
+        }
+
+    # ---- step handlers (one per agent) -----------------------------------
+
+    def _do_retrieval(self, ingestion: dict, ctx: dict, plan: dict) -> str:
+        query = self._build_query(ingestion)
+        ctx["knowledge"] = self.retrieval.run(query, k=plan["k"])
+        return f"{len(ctx['knowledge']['hits'])} section(s), k={plan['k']}"
+
+    def _do_analysis(self, ingestion: dict, ctx: dict, plan: dict) -> str:
+        ctx["analysis"] = self.analysis.run(ingestion, ctx["knowledge"])
+        return ctx["analysis"].get("situation_type", "?")
+
+    def _do_recommendation(self, ingestion: dict, ctx: dict, plan: dict) -> str:
+        signals = ingestion["summary"].get("signals", [])
+        ctx["memory_hits"] = memory.recall_similar(                # learning loop
+            situation_type=ctx["analysis"].get("situation_type", "other"),
+            signals=signals,
+        )
+        ctx["recommendation"] = self.recommendation.run(
+            ctx["analysis"], memory_hits=ctx["memory_hits"]
+        )
+        return f"{len(ctx['recommendation'].get('recommendations', []))} action(s)"
 
     # ---- helpers ---------------------------------------------------------
 
@@ -125,7 +147,6 @@ class Planner:
         asks = summary.get("customer_asks", [])
         sentiment = summary.get("sentiment", "")
 
-        # Healthy + quiet -> keep monitoring (skip the pipeline entirely).
         if (
             isinstance(health, (int, float))
             and health >= threshold
@@ -188,8 +209,6 @@ Return JSON with exactly these keys:
             plan = {}
         steps = plan.get("steps")
 
-        # The planner can legitimately choose to do nothing (empty list). We only
-        # fall back to the full pipeline when the response is missing/malformed.
         if steps is None or not isinstance(steps, list):
             return {
                 "steps": list(CANONICAL_ORDER),
@@ -222,7 +241,7 @@ Return JSON with exactly these keys:
         # 2. PLAN - deterministic rules first, then the LLM planner.
         plan = self._make_plan(ingestion, default_k=k)
 
-        # 3. ACT - execute the chosen steps against a shared context.
+        # 3. ACT - execute the chosen steps via the dispatch table.
         ctx = {
             "knowledge": {"query": "", "hits": []},
             "analysis": {},
@@ -234,32 +253,13 @@ Return JSON with exactly these keys:
             trace.append({"step": f"rule:{plan['rule']}", "detail": "skipped pipeline"})
 
         for step in plan["steps"]:
-            if step == "retrieval":
-                query = self._build_query(ingestion)
-                ctx["knowledge"] = self.retrieval.run(query, k=plan["k"])
-                trace.append({
-                    "step": "retrieval",
-                    "detail": f"{len(ctx['knowledge']['hits'])} section(s), k={plan['k']}",
-                })
-            elif step == "analysis":
-                ctx["analysis"] = self.analysis.run(ingestion, ctx["knowledge"])
-                trace.append({
-                    "step": "analysis",
-                    "detail": ctx["analysis"].get("situation_type", "?"),
-                })
-            elif step == "recommendation":
-                signals = ingestion["summary"].get("signals", [])
-                ctx["memory_hits"] = memory.recall_similar(                # learning loop
-                    situation_type=ctx["analysis"].get("situation_type", "other"),
-                    signals=signals,
-                )
-                ctx["recommendation"] = self.recommendation.run(
-                    ctx["analysis"], memory_hits=ctx["memory_hits"]
-                )
-                trace.append({
-                    "step": "recommendation",
-                    "detail": f"{len(ctx['recommendation'].get('recommendations', []))} action(s)",
-                })
+            handler = self._handlers.get(step)
+            if handler is None:
+                # Plannable per config but no handler registered yet - skip safely.
+                trace.append({"step": step, "detail": "no handler registered - skipped"})
+                continue
+            detail = handler(ingestion, ctx, plan)
+            trace.append({"step": step, "detail": detail})
 
         # If no recommendation step ran (rule short-circuit or empty plan), record
         # an explicit 'hold' so the packet is always complete and explainable.
@@ -281,7 +281,7 @@ Return JSON with exactly these keys:
         return {
             "customer_id": customer_id,
             "ingestion": ingestion,
-            "plan": {                       # makes the orchestration explainable
+            "plan": {
                 "steps": plan["steps"],
                 "reason": plan["reason"],
                 "rule": plan.get("rule"),
