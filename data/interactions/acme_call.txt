@@ -1,0 +1,8 @@
+Meeting transcript - Acme Corp quarterly review (2026-06-20)
+
+CSM: Thanks for hopping on. How are things going with the platform?
+Acme (new Ops lead): Honestly, since Dana left we've struggled to get value out of it. Half my team isn't even logging in.
+CSM: I'm sorry to hear that. Anything specific blocking them?
+Acme: We're not sure we're using the right features. And leadership is asking why we pay for 40 seats. We've started looking at a couple of cheaper alternatives, to be frank.
+CSM: Understood. Your renewal is in August, right?
+Acme: Yes. We need to see real value before then, or we may not renew.

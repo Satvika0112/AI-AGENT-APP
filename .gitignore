@@ -1,0 +1,14 @@
+# Secrets - NEVER commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local runtime data written by the platform
+data/memory.json
+
+# Editor / OS
+.DS_Store

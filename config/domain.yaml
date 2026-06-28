@@ -1,0 +1,43 @@
+# This file is the "reusability" story of the platform.
+# Change THIS file (not the code) to point the platform at a different business domain.
+
+domain: "SaaS Customer Success"
+
+# The catalogue of actions the platform is allowed to recommend.
+next_best_actions:
+  - id: schedule_checkin
+    label: "Schedule a check-in call"
+  - id: offer_training
+    label: "Offer training / enablement on a feature"
+  - id: propose_upsell
+    label: "Propose an upsell or tier upgrade"
+  - id: escalate
+    label: "Escalate to a senior CSM / exec sponsor"
+  - id: send_renewal
+    label: "Send a renewal proposal"
+  - id: share_resource
+    label: "Share a help article or best-practice guide"
+  - id: hold
+    label: "No action yet - keep monitoring"
+
+# The specialist agents the Planner is allowed to call.
+agents:
+  - ingestion
+  - retrieval
+  - analysis
+  - recommendation
+
+# Deterministic business rules, checked by the Planner BEFORE the LLM planner.
+# They guarantee predictable behaviour on clear-cut cases and act as a safety
+# backstop. Tune these here without touching any code.
+business_rules:
+  healthy_account:
+    enabled: true
+    min_health_score: 85   # at/above this, with no action signals or open asks,
+                           # the Planner short-circuits to "keep monitoring"
+
+success_metrics:
+  - churn_rate
+  - net_revenue_retention
+  - expansion_revenue
+  - health_score
