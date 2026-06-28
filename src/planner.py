@@ -37,6 +37,7 @@ import memory
 # Agents the planner may schedule. Derived from domain.yaml (reusability story);
 # ingestion is excluded because it's the fixed "sense" step that always runs.
 PLANNABLE = [a for a in ALLOWED_AGENTS if a != "ingestion"]
+ACTION_LABELS = {a["id"]: a["label"] for a in NEXT_BEST_ACTIONS}
 
 # Canonical run order. Every dependency points "leftwards" here, so sorting a
 # chosen step-set by this order automatically satisfies dependencies.

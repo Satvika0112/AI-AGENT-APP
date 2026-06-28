@@ -14,6 +14,11 @@ What it does:
 
 The pipeline is only run on the "Analyze" button and cached in session state, so
 clicking Accept/Reject does NOT re-run the (LLM-backed) pipeline.
+
+Caching: "Use cached result" replays a previously computed packet for this
+customer + retrieval depth (k) with zero Gemini calls - handy after you've hit
+the free-tier daily cap, or for a reliable live demo. Turn it off (or use Clear
+cache) to force a fresh run.
 """
 import os
 import sys
@@ -27,6 +32,7 @@ import streamlit as st
 
 from config import DATA_DIR
 import memory
+import cache
 
 st.set_page_config(page_title="Next Best Action", page_icon="🎯", layout="wide")
 
@@ -69,20 +75,40 @@ with st.sidebar:
     )
     k = st.slider("Retrieval depth (k)", 1, 8, 4,
                   help="How many knowledge sections the retrieval step may pull.")
+    use_cache = st.checkbox(
+        "Use cached result", value=True,
+        help="Replay a previously computed packet for this customer + k with no "
+             "Gemini calls. Turn off to force a fresh run.",
+    )
     run = st.button("Analyze", type="primary", use_container_width=True)
-    st.caption("Each run makes a few calls to the free Gemini tier.")
+    st.caption("A fresh run makes a few calls to the free Gemini tier. "
+               "Cached replays are free.")
+    if st.button("Clear cache", use_container_width=True,
+                 help="Delete saved packets so the next Analyze runs fresh."):
+        removed = cache.clear()
+        st.success(f"Cleared {removed} cached packet(s).")
 
 if run:
     with st.spinner(f"Planning the next best action for {customers[cid]['name']}…"):
         try:
-            st.session_state.result = get_planner().run(cid, k=k)
+            # Cache-aware: replay if asked and available, else run fresh + store.
+            result = cache.load(cid, k) if use_cache else None
+            if result is not None:
+                result["_cached"] = True
+            else:
+                result = get_planner().run(cid, k=k)
+                cache.save(cid, k, result)      # store the clean packet
+                result["_cached"] = False
+            st.session_state.result = result
             st.session_state.saved = {}  # reset per-recommendation decision flags
         except Exception as e:
             st.session_state.result = None
             st.error(
                 f"The pipeline couldn't finish: {e}\n\n"
-                "If this is a quota error, run one customer at a time or wait for "
-                "the free-tier reset. If it's a missing key, set GEMINI_API_KEY in .env."
+                "If this is a quota error, turn on **Use cached result** (after "
+                "analyzing each customer once), run one customer at a time, or "
+                "wait for the free-tier reset. If it's a missing key, set "
+                "GEMINI_API_KEY in .env."
             )
 
 
@@ -105,6 +131,12 @@ rec_block = result["recommendation"]
 name = result["ingestion"]["record"].get("name", result["customer_id"])
 
 st.title(name)
+
+# Where this packet came from: a free replay or a fresh (LLM-backed) run.
+if result.get("_cached"):
+    st.caption("⚡ Replayed from cache — no Gemini calls were made.")
+else:
+    st.caption("🔄 Freshly computed and cached for next time.")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("Situation", analysis.get("situation_type") or "not analysed")
